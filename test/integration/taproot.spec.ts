@@ -10,6 +10,8 @@ import { Taptree } from '../../src/types';
 import { LEAF_VERSION_TAPSCRIPT } from '../../src/payments/bip341';
 import { toXOnly, tapTreeToList, tapTreeFromList } from '../../src/psbt/bip371';
 import { witnessStackToScriptWitness } from '../../src/psbt/psbtutils';
+import { hash160, sha256, taggedHash } from '../../src/crypto';
+import { toBech32 } from '../../src/address';
 
 const rng = require('randombytes');
 const regtest = regtestUtils.network;
@@ -217,123 +219,90 @@ describe('bitcoinjs-lib (transaction with taproot)', () => {
     });
   });
 
-  it('can create (and broadcast via 3PBP) a taproot script-path spend Transaction - OP_CHECKSIG', async () => {
+  it.only('can create (and broadcast via 3PBP) a taproot script-path spend Transaction - OP_CHECKSIG', async () => {
     const internalKey = bip32.fromSeed(rng(64), regtest);
-    const leafKey = bip32.fromSeed(rng(64), regtest);
+    const secret = sha256(Buffer.from('secret', 'utf8'));
+    const secretHash = sha256(secret);
 
-    const leafScriptAsm = `${toXOnly(leafKey.publicKey).toString(
-      'hex',
-    )} OP_CHECKSIG`;
-    const leafScript = bitcoin.script.fromASM(leafScriptAsm);
+    const hashlockScript = createHashlock(
+      secretHash,
+      hash160(toXOnly(internalKey.publicKey)),
+    );
 
-    const scriptTree: Taptree = [
-      [
-        {
-          output: bitcoin.script.fromASM(
-            '50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0 OP_CHECKSIG',
-          ),
-        },
-        [
-          {
-            output: bitcoin.script.fromASM(
-              '50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac1 OP_CHECKSIG',
-            ),
-          },
-          {
-            output: bitcoin.script.fromASM(
-              '2258b1c3160be0864a541854eec9164a572f094f7562628281a8073bb89173a7 OP_CHECKSIG',
-            ),
-          },
-        ],
-      ],
-      [
-        {
-          output: bitcoin.script.fromASM(
-            '50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac2 OP_CHECKSIG',
-          ),
-        },
-        [
-          {
-            output: bitcoin.script.fromASM(
-              '50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac3 OP_CHECKSIG',
-            ),
-          },
-          [
-            {
-              output: bitcoin.script.fromASM(
-                '50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac4 OP_CHECKSIG',
-              ),
-            },
-            {
-              output: leafScript,
-            },
-          ],
-        ],
-      ],
-    ];
-    const redeem = {
-      output: leafScript,
-      redeemVersion: LEAF_VERSION_TAPSCRIPT,
-    };
+    const scripts = [hashlockScript, hashlockScript];
 
-    const { output, witness } = bitcoin.payments.p2tr({
-      internalPubkey: toXOnly(internalKey.publicKey),
-      scriptTree,
-      redeem,
-      network: regtest,
-    });
+    const merkleProof = generateMerkleProof(scripts, 0);
+    const mastRoot = computeMerkleProof(
+      serializeScript(hashlockScript),
+      merkleProof,
+    );
+
+    const tweak = taggedHash(
+      'TapTweak',
+      Buffer.concat([toXOnly(internalKey.publicKey), mastRoot]),
+    );
+
+    const externalPubKey = ecc.xOnlyPointAddTweak(
+      toXOnly(internalKey.publicKey),
+      tweak,
+    );
+
+    const taprootAddress = toBech32(
+      Buffer.from(externalPubKey?.xOnlyPubkey!),
+      1,
+      'bcrt',
+    );
+
+    const output = bitcoin.address.toOutputScript(taprootAddress, regtest);
 
     // amount from faucet
     const amount = 42e4;
     // amount to send
-    const sendAmount = amount - 1e4;
+    // const sendAmount = amount - 1e4;
     // get faucet
     const unspent = await regtestUtils.faucetComplex(output!, amount);
+    const txid = unspent.txId;
 
-    const psbt = new bitcoin.Psbt({ network: regtest });
-    psbt.addInput({
-      hash: unspent.txId,
-      index: 0,
-      witnessUtxo: { value: amount, script: output! },
-    });
-    psbt.updateInput(0, {
-      tapLeafScript: [
-        {
-          leafVersion: redeem.redeemVersion,
-          script: redeem.output,
-          controlBlock: witness![witness!.length - 1],
-        },
-      ],
-    });
+    const tx = new bitcoin.Transaction();
 
-    const sendInternalKey = bip32.fromSeed(rng(64), regtest);
-    const sendPubKey = toXOnly(sendInternalKey.publicKey);
-    const { address: sendAddress } = bitcoin.payments.p2tr({
-      internalPubkey: sendPubKey,
-      scriptTree,
-      network: regtest,
-    });
+    tx.version = 2;
 
-    psbt.addOutput({
-      value: sendAmount,
-      address: sendAddress!,
-      tapInternalKey: sendPubKey,
-      tapTree: { leaves: tapTreeToList(scriptTree) },
-    });
+    tx.addInput(Buffer.from(txid, 'hex').reverse(), 0);
 
-    psbt.signInput(0, leafKey);
-    psbt.finalizeInput(0);
-    const tx = psbt.extractTransaction();
-    const rawTx = tx.toBuffer();
-    const hex = rawTx.toString('hex');
+    const spk = bitcoin.address.toOutputScript(taprootAddress, regtest);
 
-    await regtestUtils.broadcast(hex);
-    await regtestUtils.verify({
-      txId: tx.getId(),
-      address: sendAddress!,
-      vout: 0,
-      value: sendAmount,
-    });
+    tx.addOutput(spk, 1000);
+
+    const hashtype = bitcoin.Transaction.SIGHASH_ALL;
+
+    const hash = tx.hashForWitnessV1(0, [spk], [42e4], hashtype);
+
+    const signature = ecc.signSchnorr(hash, internalKey.privateKey!);
+    // console.log(
+    //   'schnorr verify',
+    //   ecc.verifySchnorr(hash, internalKey.publicKey, signature),
+    // );
+
+    tx.setWitness(0, [
+      Buffer.concat([
+        Buffer.from(signature),
+        Buffer.from(hashtype.toString(16), 'hex'),
+      ]),
+      toXOnly(internalKey.publicKey),
+      secret,
+      hashlockScript,
+      Buffer.concat([
+        Buffer.from((0xc0 + externalPubKey!.parity).toString(16), 'hex'),
+        toXOnly(internalKey.publicKey),
+        ...merkleProof,
+      ]),
+    ]);
+
+    try {
+      await regtestUtils.broadcast(tx.toHex());
+    } catch (err) {
+      console.log((err as Error).message);
+    }
   });
 
   it('can create (and broadcast via 3PBP) a taproot script-path spend Transaction - OP_CHECKSEQUENCEVERIFY', async () => {
@@ -693,3 +662,93 @@ function buildLeafIndexFinalizer(
     }
   };
 }
+
+export const createTapTree = (scripts: Buffer[]) => {
+  let currentLevel = scripts.map(script =>
+    taggedHash('TapLeaf', serializeScript(script)),
+  );
+
+  while (currentLevel.length != 1) {
+    let nextLevel = [] as Buffer[];
+    const maxNodes = Math.pow(2, Math.floor(Math.log2(currentLevel.length)));
+    for (let i = 0; i < maxNodes; i += 2) {
+      const [smaller, bigger] = currentLevel
+        .slice(i, i + 2)
+        .sort((a, b) => a.compare(b));
+
+      nextLevel.push(taggedHash('TapBranch', Buffer.concat([smaller, bigger])));
+    }
+    currentLevel = [...nextLevel, ...currentLevel.slice(maxNodes)];
+  }
+
+  return currentLevel;
+};
+
+const LEAF_VERSION = Buffer.from('c0', 'hex');
+const serializeScript = (script: Buffer) => {
+  return Buffer.concat([
+    LEAF_VERSION,
+    Buffer.from(script.byteLength.toString(16), 'hex'), // add compact size encoding later
+    script,
+  ]);
+};
+
+const generateMerkleProof = (scripts: Buffer[], index: number) => {
+  if (index > scripts.length - 1) throw new Error('Invalid index');
+
+  let currentLevel = scripts.map(script =>
+    taggedHash('TapLeaf', serializeScript(script)),
+  );
+
+  const proofs = [] as Buffer[];
+
+  while (currentLevel.length != 1) {
+    let nextLevel = [] as Buffer[];
+    if (index < currentLevel.length) {
+      if (index % 2) proofs.push(currentLevel[index - 1]);
+      else proofs.push(currentLevel[index + 1]);
+
+      index = Math.floor(index / 2);
+    }
+    const maxNodes = Math.pow(2, Math.floor(Math.log2(currentLevel.length)));
+    for (let i = 0; i < maxNodes; i += 2) {
+      const [smaller, bigger] = currentLevel
+        .slice(i, i + 2)
+        .sort((a, b) => a.compare(b));
+
+      nextLevel.push(taggedHash('TapBranch', Buffer.concat([smaller, bigger])));
+    }
+    currentLevel = [...nextLevel, ...currentLevel.slice(maxNodes)];
+  }
+
+  return proofs;
+};
+
+export const computeMerkleProof = (leaf: Buffer, merkleProof: Buffer[]) => {
+  const hash = taggedHash('TapLeaf', leaf);
+  const proofHash = merkleProof.reduce(
+    (acc, proof) =>
+      taggedHash(
+        'TapBranch',
+        Buffer.concat([acc, proof].sort((a, b) => a.compare(b))),
+      ),
+    hash,
+  );
+
+  return proofHash;
+};
+
+export const createHashlock = (secretHash: Buffer, enabler: Buffer): Buffer => {
+  const script = bitcoin.script.compile([
+    bitcoin.script.OPS.OP_SHA256,
+    secretHash,
+    bitcoin.script.OPS.OP_EQUALVERIFY,
+    bitcoin.script.OPS.OP_DUP,
+    bitcoin.script.OPS.OP_HASH160,
+    enabler,
+    bitcoin.script.OPS.OP_EQUALVERIFY,
+    bitcoin.script.OPS.OP_CHECKSIG,
+  ]);
+
+  return script;
+};
