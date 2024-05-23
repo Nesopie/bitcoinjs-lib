@@ -275,7 +275,13 @@ describe('bitcoinjs-lib (transaction with taproot)', () => {
 
     const hashtype = bitcoin.Transaction.SIGHASH_ALL;
 
-    const hash = tx.hashForWitnessV1(0, [spk], [42e4], hashtype);
+    const hash = tx.hashForWitnessV1(
+      0,
+      [spk],
+      [42e4],
+      hashtype,
+      taggedHash('TapLeaf', serializeScript(hashlockScript)),
+    );
 
     const signature = ecc.signSchnorr(hash, internalKey.privateKey!);
     // console.log(
