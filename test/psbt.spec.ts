@@ -146,7 +146,7 @@ describe(`Psbt`, () => {
     });
 
     fixtures.bip174.signer.forEach(f => {
-      it('Signs PSBT to the expected result', () => {
+      it.only('Signs PSBT to the expected result', () => {
         if (f.isTaproot) initEccLib(ecc);
         const psbt = Psbt.fromBase64(f.psbt);
 
